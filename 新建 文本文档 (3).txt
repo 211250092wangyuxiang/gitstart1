@@ -1,0 +1,141 @@
+import git
+import tree_sitter_c as tsc
+from tree_sitter import Language, Parser, Node
+
+# 初始化 Tree-sitter
+# 注意：这里假设使用的是 tree-sitter >= 0.22 的 API
+C_LANGUAGE = Language(tsc.language())
+parser = Parser(C_LANGUAGE)
+
+def get_file_content(repo: git.Repo, commit_hash: str, file_path: str):
+    """
+    从指定 commit 获取文件内容
+    """
+    try:
+        commit = repo.commit(commit_hash)
+        # 获取文件对象 (Blob)
+        target_file = commit.tree / file_path
+        # 读取二进制内容 (tree-sitter parse 需要 bytes)
+        return target_file.data_stream.read()
+    except KeyError:
+        # 文件可能在该 commit 中不存在 (例如新增或被删除)
+        return None
+    except Exception as e:
+        print(f"Error reading file {file_path} at {commit_hash}: {e}")
+        return None
+
+def extract_function_node(source_code: bytes, line_no: int):
+    """
+    根据行号提取所在的 C 语言函数节点文本
+    :param source_code: 文件源码 (bytes)
+    :param line_no: 1-based 行号
+    :return: 函数完整代码字符串，如果没找到则返回 None
+    """
+    if not source_code:
+        return None
+
+    tree = parser.parse(source_code)
+    root_node = tree.root_node
+    
+    # 转换行号：用户输入是 1-based，Tree-sitter 是 0-based
+    row = line_no - 1
+    
+    # 防止行号越界
+    if row < 0:
+        return None
+        
+    # 查找指定行所在的最小节点
+    # 我们查找该行的起始位置 (row, 0) 到该行的结束位置 (row, 0)
+    # 这样可以定位到该行所属的代码块
+    node = root_node.descendant_for_point_range((row, 0), (row, 0))
+    
+    # 向上回溯，直到找到函数定义 (function_definition)
+    while node:
+        if node.type == 'function_definition':
+            # 找到函数定义，提取对应的源码
+            # 使用 bytes 切片然后解码，保证精确
+            func_bytes = source_code[node.start_byte : node.end_byte]
+            return func_bytes.decode('utf-8', errors='replace')
+        node = node.parent
+
+    return None
+
+def extract_c_function_change(repo_path, file_path, commit_id, 
+                              line_no_before, line_no_after, 
+                              num_before, num_after):
+    """
+    主处理函数
+    """
+    result = {
+        'repo_path': repo_path,
+        'commit_id': commit_id,
+        'file_path': file_path,
+        'func_before': None,
+        'func_after': None
+    }
+
+    try:
+        repo = git.Repo(repo_path)
+        
+        # 获取当前 Commit 对象
+        commit_after = repo.commit(commit_id)
+        
+        # 获取父 Commit 对象 (修改前)
+        # 注意：如果这是初始提交(Initial Commit)，可能没有 parent
+        parents = commit_after.parents
+        commit_before = parents[0] if parents else None
+
+        # 1. 处理修改后 (After)
+        content_after = get_file_content(repo, commit_after.hexsha, file_path)
+        if content_after:
+            # 尝试根据 line_no_after 提取函数
+            # 即使 line_no_after 是函数中间的某一行，extract_function_node 也会向上查找到整个函数
+            result['func_after'] = extract_function_node(content_after, line_no_after)
+
+        # 2. 处理修改前 (Before)
+        if commit_before:
+            content_before = get_file_content(repo, commit_before.hexsha, file_path)
+            if content_before:
+                # 尝试根据 line_no_before 提取函数
+                result['func_before'] = extract_function_node(content_before, line_no_before)
+        
+    except Exception as e:
+        print(f"Processing error: {e}")
+
+    return result
+
+# ==========================================
+# 使用示例
+# ==========================================
+if __name__ == "__main__":
+    # 假设你有一个本地仓库路径
+    # 请修改为实际存在的路径和参数进行测试
+    
+    # 示例参数
+    repo_path = "/path/to/your/local/git/repo" 
+    file_path = "src/main.c"             # 相对仓库根目录的路径
+    commit_id = "a1b2c3d4..."            # 具体的 commit hash
+    
+    # 假设 diff 信息如下：
+    # 修改前：函数从第 100 行开始
+    # 修改后：函数从第 102 行开始
+    line_no_before = 100
+    line_no_after = 102
+    num_before = 5
+    num_after = 6
+
+    # 运行提取
+    # 注意：如果路径不存在会报错，这里仅为代码展示
+    try:
+        data = extract_c_function_change(
+            repo_path, file_path, commit_id, 
+            line_no_before, line_no_after, 
+            num_before, num_after
+        )
+        
+        print("Repo:", data['repo_path'])
+        print("Before Function Snippet:", data['func_before'][:50] if data['func_before'] else "None")
+        print("After Function Snippet:", data['func_after'][:50] if data['func_after'] else "None")
+        
+    except Exception as e:
+        print(f"Example run failed (expected if path is invalid): {e}")
